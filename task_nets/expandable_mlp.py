@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -8,26 +8,40 @@ import torch.nn.functional as F
 class ExpandableMLP(nn.Module):
     """
     MLP espandibile: 784 -> h1 -> h2 -> 10.
-    Le azioni controllano la crescita di (h1, h2, input dell'output).
-    Per replicare il paper: action_spec tipicamente [30,30,30] e azioni in 0..29. 
+    + Task-aware inference: forward(x, task_id) usa slicing dei pesi fino alle dimensioni del task.
     """
+
     def __init__(self, input_dim: int, hidden_sizes: List[int], num_classes: int, action_spec: List[int]):
         super().__init__()
         self.input_dim = input_dim
-        self.hidden_sizes = list(hidden_sizes)
+        self.hidden_sizes = list(hidden_sizes)  # [h1, h2]
         self.num_classes = num_classes
         self._action_spec = list(action_spec)
+
+        # task_slices[j] = (h1_j, h2_j) dimensioni "timestamped" dopo aver finito il task j
+        self.task_slices: List[Tuple[int, int]] = []
+
         self._build()
 
     def action_spec(self) -> List[int]:
-        # Ritorna la size della softmax per step (n_i). Qui = [30,30,30] nel setup MNIST. 
         return list(self._action_spec)
 
     def _build(self):
         dims = [self.input_dim] + self.hidden_sizes + [self.num_classes]
-        self.layers = nn.ModuleList([nn.Linear(dims[i], dims[i+1]) for i in range(len(dims) - 1)])
+        self.layers = nn.ModuleList([nn.Linear(dims[i], dims[i + 1]) for i in range(len(dims) - 1)])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def register_task_slice(self):
+        """Chiama questo quando hai finito di addestrare il task corrente (dopo la promozione)."""
+        if len(self.hidden_sizes) < 2:
+            raise ValueError("Expected hidden_sizes like [h1, h2].")
+        self.task_slices.append((int(self.hidden_sizes[0]), int(self.hidden_sizes[1])))
+
+    def forward(self, x: torch.Tensor, task_id: Optional[int] = None) -> torch.Tensor:
+        if task_id is None:
+            return self._forward_full(x)
+        return self._forward_task(x, int(task_id))
+
+    def _forward_full(self, x: torch.Tensor) -> torch.Tensor:
         h = x
         for i, layer in enumerate(self.layers):
             h = layer(h)
@@ -35,17 +49,35 @@ class ExpandableMLP(nn.Module):
                 h = F.relu(h)
         return h
 
+    def _forward_task(self, x: torch.Tensor, task_id: int) -> torch.Tensor:
+        if task_id < 0 or task_id >= len(self.task_slices):
+            raise ValueError(f"task_id={task_id} out of range (0..{len(self.task_slices)-1}).")
+
+        h1_j, h2_j = self.task_slices[task_id]
+
+        # layer0: input -> h1
+        l0 = self.layers[0]
+        w0 = l0.weight[:h1_j, :]
+        b0 = l0.bias[:h1_j]
+        h1 = F.relu(F.linear(x, w0, b0))
+
+        # layer1: h1 -> h2
+        l1 = self.layers[1]
+        w1 = l1.weight[:h2_j, :h1_j]
+        b1 = l1.bias[:h2_j]
+        h2 = F.relu(F.linear(h1, w1, b1))
+
+        # layer2: h2 -> out
+        l2 = self.layers[2]
+        w2 = l2.weight[:, :h2_j]
+        b2 = l2.bias  # bias condiviso (nel nostro freezing lo blocchiamo dopo task 0)
+        out = F.linear(h2, w2, b2)
+        return out
+
     def expanded_copy(self, actions: List[int]) -> "ExpandableMLP":
-        """
-        actions: [a0, a1, a2] (len = 3) per MLP con 3 layer lineari.
-        - a0 cresce hidden1
-        - a1 cresce hidden2
-        - a2 (per semplicità) cresce hidden2 (equivalente a far crescere input dell'output)
-        """
         if len(actions) != len(self.layers):
             raise ValueError(f"Expected {len(self.layers)} actions, got {len(actions)}")
 
-        # nuova dimensione hidden
         new_hidden = self.hidden_sizes.copy()
         new_hidden[0] += int(actions[0])
         if len(new_hidden) > 1:
@@ -57,6 +89,9 @@ class ExpandableMLP(nn.Module):
             num_classes=self.num_classes,
             action_spec=self._action_spec,
         )
+
+        # copia lo storico task_slices (timestamp) nel child
+        child.task_slices = list(self.task_slices)
 
         # copia pesi nella parte comune
         with torch.no_grad():

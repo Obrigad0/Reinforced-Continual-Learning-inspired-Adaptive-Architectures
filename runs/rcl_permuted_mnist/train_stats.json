@@ -1,0 +1,26 @@
+{
+  "train_stats": [
+    {
+      "task": 0,
+      "val_acc": 0.9696666666666667,
+      "test_acc": 0.9729,
+      "note": "base_train"
+    },
+    {
+      "task": 1,
+      "best_reward": 0.9194,
+      "best_actions": [
+        24,
+        1,
+        2
+      ],
+      "best_val_acc": 0.9275,
+      "best_test_acc": 0.9277,
+      "best_complexity": 27
+    }
+  ],
+  "first_task_curve_online": [
+    0.9729,
+    0.9729
+  ]
+}

@@ -27,14 +27,17 @@ def get_device(name: str) -> torch.device:
 
 
 @torch.no_grad()
-def eval_accuracy(model, loader, device: torch.device) -> float:
+def eval_accuracy(model, loader, device: torch.device, task_id: int | None = None) -> float:
     model.eval()
     total = 0
     correct = 0
     for x, y in loader:
         x = x.to(device)
         y = y.to(device)
-        logits = model(x)
+        try:
+            logits = model(x, task_id=task_id) if task_id is not None else model(x)
+        except TypeError:
+            logits = model(x)
         pred = logits.argmax(dim=1)
         total += y.numel()
         correct += (pred == y).sum().item()
@@ -52,7 +55,6 @@ def main():
 
     out_dir = Path(cfg["experiment"]["out_dir"])
     ckpt_dir = Path(args.ckpt_dir) if args.ckpt_dir is not None else (out_dir / "checkpoints")
-
     device = get_device(cfg["evaluation"]["device"])
 
     dataset_obj = instantiate(cfg["dataset"])
@@ -65,20 +67,50 @@ def main():
     num_tasks = int(cfg["dataset"]["num_tasks"])
     batch_size = int(cfg["evaluation"]["batch_size"])
 
-    accs = []
+    # Precarico tutti i test set una sola volta
+    tasks_data = [dataset_obj.get_task(j, batch_size=batch_size) for j in range(num_tasks)]
+
+    # A[t][j]
+    A = [[None for _ in range(num_tasks)] for _ in range(num_tasks)]
+
     for t in range(num_tasks):
         ckpt = torch.load(ckpt_dir / f"task_{t:03d}.pt", map_location=device)
-        model = TaskCls(**{k: v for k, v in task_cfg.items()}).to(device)
+
+        task_net_hidden_sizes = ckpt.get("task_net_hidden_sizes", task_cfg.get("hidden_sizes"))
+        model = TaskCls(
+            input_dim=task_cfg["input_dim"],
+            hidden_sizes=task_net_hidden_sizes,
+            num_classes=task_cfg["num_classes"],
+            action_spec=task_cfg["action_spec"],
+        ).to(device)
+
         model.load_state_dict(ckpt["task_net_state"])
 
-        task_data = dataset_obj.get_task(t, batch_size=batch_size)
-        accs.append(float(eval_accuracy(model, task_data["test"], device)))
+        if "task_net_task_slices" in ckpt and ckpt["task_net_task_slices"] is not None:
+            model.task_slices = ckpt["task_net_task_slices"]
+
+        # Valuto su tutti i task visti finora (j <= t)
+        for j in range(t + 1):
+            A[t][j] = float(eval_accuracy(model, tasks_data[j]["test"], device, task_id=j))
+
+    # Metriche derivate
+    first_task_curve = [A[t][0] for t in range(num_tasks)]
+    acc_by_task_final = [A[num_tasks - 1][j] for j in range(num_tasks)]
+
+    forgetting_by_task = []
+    for j in range(num_tasks):
+        best = max(A[t][j] for t in range(j, num_tasks) if A[t][j] is not None)
+        last = A[num_tasks - 1][j]
+        forgetting_by_task.append(float(best - last))
 
     metrics = {
-        "acc_by_task": accs,
-        "avg_acc": sum(accs) / len(accs),
-        "first_task_acc": accs[0],
-        "forgetting_first_task": float(accs[0] - accs[-1]),
+        "A_matrix": A,  # triangolare: valori solo per j<=t
+        "first_task_curve": first_task_curve,
+        "acc_by_task_final": acc_by_task_final,
+        "avg_acc_final": sum(acc_by_task_final) / len(acc_by_task_final),
+        "forgetting_by_task": forgetting_by_task,
+        "avg_forgetting": sum(forgetting_by_task) / len(forgetting_by_task),
+        "forgetting_first_task": float(forgetting_by_task[0]),
     }
 
     (out_dir / "eval").mkdir(parents=True, exist_ok=True)
