@@ -1,0 +1,45 @@
+seed: 71
+experiment:
+  name: "rcl_permuted_mnist"
+  out_dir: "./runs/rcl_permuted_mnist"
+
+training:
+  device: "cuda"              # "cpu" o "cuda"
+  batch_size: 32
+  epochs_task: 15
+  lr_task: 0.001
+  lr_controller: 0.001
+  lr_value: 0.005
+  controller_trials: 30       # number of child net for task
+  grad_clip: 5.0
+
+rcl:
+  reward_alpha: 0.0003        # MNIST permutations 
+
+dataset:
+  _target_: dataset:PermutedMNISTDataset
+  data_dir: "./data"
+  num_tasks: 10
+  permutation_seed: 1900
+  train_val_split: 0.9
+  num_workers: 0 #1
+
+task_net:
+  _target_: task_nets.expandable_mlp:ExpandableMLP
+  input_dim: 784
+  hidden_sizes: [312, 128]
+  num_classes: 10
+  action_spec: [30, 30, 30]   # 3 decisioni: L1, L2, L3 (range 0..29) [file:2]
+
+controller:
+  _target_: controllers.lstm_controller:LSTMController
+  hidden_size: 100
+  num_layers: 2
+
+value_net:
+  _target_: value_nets.mlp_value:MLPValueNet
+  hidden_size: 100
+
+evaluation:
+  batch_size: 256
+  device: "cuda"
