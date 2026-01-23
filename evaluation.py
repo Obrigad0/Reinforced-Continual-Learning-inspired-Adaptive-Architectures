@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 
-from router_model import RouterActorCritic
+from router.router_model import RouterActorCritic
 
 
 # -----------------------
