@@ -1,4 +1,4 @@
-# evaluation.py (print migliorati)
+# evaluation.py (modulare)
 from __future__ import annotations
 
 import argparse
@@ -47,14 +47,13 @@ def _fmt_acc(x: float) -> str:
 
 def _torch_load(path: Path, map_location, *, weights_only_preferred: bool = True):
     """
-    Try to avoid the torch.load FutureWarning by using weights_only=True when available.
-    If not supported or fails, fall back to standard torch.load with a clear message. [web:13]
+    Usa weights_only=True quando disponibile per ridurre warning e rischi di unpickling.
+    Documentazione: torch.load. 
     """
     if weights_only_preferred:
         try:
             return torch.load(path, map_location=map_location, weights_only=True)
         except TypeError:
-            # older PyTorch: no weights_only kwarg
             pass
         except Exception as e:
             print(
@@ -63,11 +62,9 @@ def _torch_load(path: Path, map_location, *, weights_only_preferred: bool = True
                 flush=True,
             )
 
-    # Fall back: might show FutureWarning in some PyTorch versions [web:13]
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always", category=FutureWarning)
         obj = torch.load(path, map_location=map_location)
-        # If a FutureWarning was emitted, show a friendly one-liner
         if any(issubclass(ww.category, FutureWarning) for ww in w):
             print(
                 "[INFO] Nota: PyTorch ha mostrato un FutureWarning su torch.load(weights_only=False). "
@@ -112,24 +109,57 @@ def find_last_ckpt(ckpt_dir: Path) -> Path:
     return cands[-1]
 
 
+# def load_tasknet_last(cfg: dict, device: torch.device, ckpt_dir: Path):
+#     ckpt_path = find_last_ckpt(ckpt_dir)
+#     ckpt = _torch_load(ckpt_path, map_location=device, weights_only_preferred=True)
+
+#     # MODULARE: costruiamo la tasknet dal YAML (MLP o VGG o altro)
+#     tasknet = instantiate(cfg["task_net"]).to(device)
+
+#     tasknet.load_state_dict(ckpt["task_net_state"])
+
+#     task_slices = ckpt.get("task_net_task_slices", None)
+#     if task_slices is None:
+#         raise KeyError("Checkpoint non contiene task_net_task_slices (serve per task-aware inference).")
+#     tasknet.task_slices = task_slices
+
+#     return tasknet, ckpt_path
 def load_tasknet_last(cfg: dict, device: torch.device, ckpt_dir: Path):
     ckpt_path = find_last_ckpt(ckpt_dir)
     ckpt = _torch_load(ckpt_path, map_location=device, weights_only_preferred=True)
 
-    task_cfg = dict(cfg["task_net"])
+    task_cfg = dict(cfg["task_net"])  # copia, la modifichiamo eventualmente
+
+    # --- VGG FIX: se nel ckpt ci sono task_slices, usiamo l'ultimo slice per ricostruire i canali finali
+    task_slices = ckpt.get("task_net_task_slices", None)
+    if task_slices is not None and isinstance(task_slices, list) and len(task_slices) > 0:
+        last_slice = task_slices[-1]
+        # last_slice deve essere [C1, C2, ..., CB]
+        if isinstance(last_slice, list) and all(isinstance(x, (int, float)) for x in last_slice):
+            # se il modello in YAML ha block_specs, possiamo aggiornarli mantenendo num_convs e cambiando out_channels
+            if "block_specs" in task_cfg:
+                bs = task_cfg["block_specs"]
+                # bs può essere [[num_convs, out_channels], ...] oppure [(num_convs, out_channels), ...]
+                if isinstance(bs, list) and len(bs) == len(last_slice):
+                    new_bs = []
+                    for (nc, _oc), new_c in zip(bs, last_slice):
+                        new_bs.append([int(nc), int(new_c)])
+                    task_cfg["block_specs"] = new_bs
+
+    # istanzia il modello (ora con block_specs aggiornati se era VGG)
     TaskCls = import_from_target(task_cfg.pop("_target_"))
+    tasknet = TaskCls(**task_cfg).to(device)
 
-    hidden_sizes = ckpt.get("task_net_hidden_sizes", task_cfg["hidden_sizes"])
-    tasknet = TaskCls(
-        input_dim=task_cfg["input_dim"],
-        hidden_sizes=hidden_sizes,
-        num_classes=task_cfg["num_classes"],
-        action_spec=task_cfg["action_spec"],
-    ).to(device)
-
+    # carica pesi
     tasknet.load_state_dict(ckpt["task_net_state"])
-    tasknet.task_slices = ckpt["task_net_task_slices"]
+
+    # ripristina task_slices (necessario per inference task-aware)
+    if task_slices is None:
+        raise KeyError("Checkpoint non contiene task_net_task_slices (serve per task-aware inference).")
+    tasknet.task_slices = task_slices
+
     return tasknet, ckpt_path
+
 
 
 @torch.no_grad()
@@ -271,9 +301,6 @@ def main():
         "tasknet_ckpt": str(tasknet_ckpt),
     }
 
-    # -----------------------
-    # Run selected evaluations
-    # -----------------------
     _section("EVALUATION - RUN")
 
     if args.mode in ("oracle", "both"):
@@ -293,10 +320,14 @@ def main():
         print(f"\n[RUN] Router end-to-end: loading router from {router_ckpt_path}", flush=True)
         rckpt = _torch_load(router_ckpt_path, map_location=device, weights_only_preferred=True)
 
-        rcfg = rckpt.get("router_cfg", {"hidden": 256, "emb": 128})
+        rcfg = rckpt.get("router_cfg", {"hidden": 256, "emb": 128, "input_dim": None})
+
+        # MODULARE: input_dim dal YAML (non dalla tasknet)
+        router_input_dim = int(cfg.get("router", {}).get("input_dim", 784))
+
         router = RouterActorCritic(
             num_tasks=num_tasks,
-            input_dim=int(cfg["task_net"]["input_dim"]),
+            input_dim=router_input_dim,
             hidden=int(rcfg["hidden"]),
             emb=int(rcfg["emb"]),
         ).to(device)
@@ -326,13 +357,9 @@ def main():
         results["tryall_time_sec"] = dt
         print(f"[RUN] Try-all: DONE in {dt:.2f}s | tryall_acc={_fmt_acc(tryall_acc)}", flush=True)
 
-    # -----------------------
-    # Save + final print
-    # -----------------------
     results["total_time_sec"] = time.perf_counter() - t_global0
 
     _section("EVALUATION - RESULTS (SUMMARY)")
-    # Stampa “umana”
     human = {
         "oracle_acc": _fmt_acc(results["oracle_acc"]) if "oracle_acc" in results else None,
         "acc_end2end": _fmt_acc(results["acc_end2end"]) if "acc_end2end" in results else None,
@@ -340,7 +367,6 @@ def main():
         "tryall_acc": _fmt_acc(results["tryall_acc"]) if "tryall_acc" in results else None,
         "total_time_sec": f"{results['total_time_sec']:.2f}",
     }
-    # Rimuove i None dalla vista summary
     human = {k: v for k, v in human.items() if v is not None}
     _kv(human)
 

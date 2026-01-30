@@ -11,10 +11,10 @@ class PermutePixelsTransform:
         self.perm = perm
 
     def __call__(self, x):
-        # x: Tensor [1,28,28]
         v = x.view(-1)          # 784
-        v = v[self.perm]        # permutazione arbitraria degli indici
-        return v                # ritorno flat: perfetto per MLP
+        v = v[self.perm]        # permutazione
+        return v.view(1, 28, 28)  # torna immagine per CNN
+
 
 
 @dataclass

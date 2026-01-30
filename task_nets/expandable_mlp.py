@@ -7,20 +7,19 @@ import torch.nn.functional as F
 
 class ExpandableMLP(nn.Module):
     """
-    MLP espandibile: 784 -> h1 -> h2 -> 10.
-    + Task-aware inference: forward(x, task_id) usa slicing dei pesi fino alle dimensioni del task.
+    MLP espandibile: input_dim -> h1 -> h2 -> num_classes
+    + Task-aware inference: forward(x, task_id) usa slicing dei pesi.
+    + Modularità: apply_freeze_policy(parent=...) e actions_complexity(actions).
     """
 
     def __init__(self, input_dim: int, hidden_sizes: List[int], num_classes: int, action_spec: List[int]):
         super().__init__()
-        self.input_dim = input_dim
-        self.hidden_sizes = list(hidden_sizes)  # [h1, h2]
-        self.num_classes = num_classes
+        self.input_dim = int(input_dim)
+        self.hidden_sizes = list(hidden_sizes)
+        self.num_classes = int(num_classes)
         self._action_spec = list(action_spec)
 
-        # task_slices[j] = (h1_j, h2_j) dimensioni "timestamped" dopo aver finito il task j
         self.task_slices: List[Tuple[int, int]] = []
-
         self._build()
 
     def action_spec(self) -> List[int]:
@@ -31,12 +30,13 @@ class ExpandableMLP(nn.Module):
         self.layers = nn.ModuleList([nn.Linear(dims[i], dims[i + 1]) for i in range(len(dims) - 1)])
 
     def register_task_slice(self):
-        """Chiama questo quando hai finito di addestrare il task corrente (dopo la promozione)."""
         if len(self.hidden_sizes) < 2:
             raise ValueError("Expected hidden_sizes like [h1, h2].")
         self.task_slices.append((int(self.hidden_sizes[0]), int(self.hidden_sizes[1])))
 
     def forward(self, x: torch.Tensor, task_id: Optional[int] = None) -> torch.Tensor:
+        if x.dim() > 2:
+            x = x.view(x.size(0), -1)
         if task_id is None:
             return self._forward_full(x)
         return self._forward_task(x, int(task_id))
@@ -55,22 +55,19 @@ class ExpandableMLP(nn.Module):
 
         h1_j, h2_j = self.task_slices[task_id]
 
-        # layer0: input -> h1
         l0 = self.layers[0]
         w0 = l0.weight[:h1_j, :]
         b0 = l0.bias[:h1_j]
         h1 = F.relu(F.linear(x, w0, b0))
 
-        # layer1: h1 -> h2
         l1 = self.layers[1]
         w1 = l1.weight[:h2_j, :h1_j]
         b1 = l1.bias[:h2_j]
         h2 = F.relu(F.linear(h1, w1, b1))
 
-        # layer2: h2 -> out
         l2 = self.layers[2]
         w2 = l2.weight[:, :h2_j]
-        b2 = l2.bias  # bias condiviso (nel nostro freezing lo blocchiamo dopo task 0)
+        b2 = l2.bias
         out = F.linear(h2, w2, b2)
         return out
 
@@ -78,6 +75,8 @@ class ExpandableMLP(nn.Module):
         if len(actions) != len(self.layers):
             raise ValueError(f"Expected {len(self.layers)} actions, got {len(actions)}")
 
+        # Qui actions sono già "delta" perché nel tuo setup MLP usavi action_spec grandi (30)
+        # e trattavi l'indice come delta diretto.
         new_hidden = self.hidden_sizes.copy()
         new_hidden[0] += int(actions[0])
         if len(new_hidden) > 1:
@@ -90,10 +89,8 @@ class ExpandableMLP(nn.Module):
             action_spec=self._action_spec,
         )
 
-        # copia lo storico task_slices (timestamp) nel child
         child.task_slices = list(self.task_slices)
 
-        # copia pesi nella parte comune
         with torch.no_grad():
             for old_layer, new_layer in zip(self.layers, child.layers):
                 ow, ob = old_layer.weight, old_layer.bias
@@ -104,3 +101,61 @@ class ExpandableMLP(nn.Module):
                 nb[:out_common].copy_(ob[:out_common])
 
         return child
+
+    def actions_complexity(self, actions: List[int]) -> float:
+        # Manteniamo il comportamento storico del tuo codice (proxy semplice).
+        return float(sum(actions))
+
+    def apply_freeze_policy(self, parent: "ExpandableMLP") -> bool:
+        """
+        Paper-style: allena solo i parametri nuovi. Implementazione uguale a quella
+        che avevi in rcl.py ma spostata dentro al modello per modularità.
+        """
+        if not hasattr(self, "layers") or not hasattr(parent, "hidden_sizes"):
+            return False
+        if len(self.layers) != 3 or len(self.hidden_sizes) < 2:
+            return False
+        if parent.hidden_sizes is None or len(parent.hidden_sizes) < 2:
+            return False
+
+        old_h1, old_h2 = int(parent.hidden_sizes[0]), int(parent.hidden_sizes[1])
+        new_h1, new_h2 = int(self.hidden_sizes[0]), int(self.hidden_sizes[1])
+
+        # layer0
+        l0 = self.layers[0]
+        m_w0 = torch.zeros_like(l0.weight)
+        m_b0 = torch.zeros_like(l0.bias)
+        if new_h1 > old_h1:
+            m_w0[old_h1:new_h1, :] = 1.0
+            m_b0[old_h1:new_h1] = 1.0
+        l0.weight.register_hook(lambda g, m=m_w0: g * m.to(g.device))
+        l0.bias.register_hook(lambda g, m=m_b0: g * m.to(g.device))
+
+        # layer1
+        l1 = self.layers[1]
+        m_w1 = torch.zeros_like(l1.weight)
+        m_b1 = torch.zeros_like(l1.bias)
+        if new_h2 > old_h2:
+            m_w1[old_h2:new_h2, :] = 1.0
+            m_b1[old_h2:new_h2] = 1.0
+        if new_h1 > old_h1:
+            m_w1[:, old_h1:new_h1] = 1.0
+        l1.weight.register_hook(lambda g, m=m_w1: g * m.to(g.device))
+        l1.bias.register_hook(lambda g, m=m_b1: g * m.to(g.device))
+
+        # layer2
+        l2 = self.layers[2]
+        m_w2 = torch.zeros_like(l2.weight)
+        m_b2 = torch.zeros_like(l2.bias)
+        if new_h2 > old_h2:
+            m_w2[:, old_h2:new_h2] = 1.0
+        m_b2[:] = 0.0
+        l2.weight.register_hook(lambda g, m=m_w2: g * m.to(g.device))
+        l2.bias.register_hook(lambda g, m=m_b2: g * m.to(g.device))
+
+        return True
+    
+    def task_costs(self, device=None) -> torch.Tensor:
+        # costo per task = h1 + h2 (come il vecchio slice_cost)
+        dev = device if device is not None else next(self.parameters()).device
+        return torch.tensor([a + b for (a, b) in self.task_slices], dtype=torch.float32, device=dev)

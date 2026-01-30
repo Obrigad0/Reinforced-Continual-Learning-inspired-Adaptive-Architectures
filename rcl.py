@@ -8,6 +8,11 @@ import torch
 import torch.nn.functional as F
 import yaml
 
+# plotting
+import matplotlib
+matplotlib.use("Agg")  # salva png senza aprire finestre
+import matplotlib.pyplot as plt
+
 
 # -----------------------
 # Utils
@@ -15,6 +20,7 @@ import yaml
 def set_seed(seed: int):
     import random
     import numpy as np
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -40,6 +46,13 @@ def save_json(obj, path: str | Path):
         json.dump(obj, f, indent=2)
 
 
+def append_jsonl(obj, path: str | Path):
+    path = Path(path)
+    ensure_dir(path.parent)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj) + "\n")
+
+
 def save_ckpt(path: str | Path, payload: dict):
     path = Path(path)
     ensure_dir(path.parent)
@@ -57,20 +70,19 @@ def eval_accuracy(model, loader, device: torch.device, task_id: int | None = Non
     for x, y in loader:
         x = x.to(device)
         y = y.to(device)
-
-        # task-aware se il modello supporta task_id, altrimenti fallback
         try:
             logits = model(x, task_id=task_id) if task_id is not None else model(x)
         except TypeError:
             logits = model(x)
-
         pred = logits.argmax(dim=1)
         total += y.numel()
         correct += (pred == y).sum().item()
-
     return correct / max(1, total)
 
 
+# -----------------------
+# Train supervised
+# -----------------------
 def train_supervised(
     model,
     loader,
@@ -87,7 +99,6 @@ def train_supervised(
         total = 0
         correct = 0
         loss_sum = 0.0
-
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)
@@ -97,8 +108,10 @@ def train_supervised(
 
             opt.zero_grad()
             loss.backward()
+
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+
             opt.step()
 
             with torch.no_grad():
@@ -108,14 +121,14 @@ def train_supervised(
 
         if log:
             print(
-                f"    [train] epoch {ep:03d}/{epochs} "
+                f" [train] epoch {ep:03d}/{epochs} "
                 f"loss={loss_sum / max(1,total):.4f} acc={correct / max(1,total):.4f}",
                 flush=True,
             )
 
 
 # -----------------------
-# YAML
+# YAML instantiate
 # -----------------------
 def import_from_target(target: str):
     """target: 'package.module:ClassName'"""
@@ -162,31 +175,7 @@ def validate_action_spec(task_net, controller, cfg: dict):
 # -----------------------
 # Value net helper
 # -----------------------
-# def value_net_scalar(value_net, device: torch.device, t: int):
-#     # 1) la tuValueNet vuole device esplicito
-#     try:
-#         v = value_net(device=device)
-#         return v.reshape(())
-#     except TypeError:
-#         pass
-
-#     # 2) fallback: value_net() senza args
-#     try:
-#         v = value_net()
-#         if not torch.is_tensor(v):
-#             v = torch.tensor(float(v), device=device)
-#         return v.reshape(())
-#     except TypeError:
-#         pass
-
-#     # 3) fallback: value_net([[t]])
-#     s = torch.tensor([[float(t)]], device=device)
-#     v = value_net(s)
-#     if not torch.is_tensor(v):
-#         v = torch.tensor(float(v), device=device)
-#     return v.reshape(())
 def value_net_scalar(value_net, device: torch.device, t: int, num_tasks: int):
-
     denom = max(1, num_tasks - 1)
     s = torch.tensor([[float(t) / float(denom)]], device=device)
     v = value_net(s)
@@ -196,55 +185,141 @@ def value_net_scalar(value_net, device: torch.device, t: int, num_tasks: int):
 
 
 # -----------------------
-# Freezing: ExpandableMLP-specific
+# Generic hooks (modular)
 # -----------------------
-def register_freeze_masks_expandable_mlp(child, old_hidden_sizes):
-    """
-    Train only newly added parameters (paper-style).
-    """
-    if not (hasattr(child, "layers") and hasattr(child, "hidden_sizes")):
-        return False
-    if len(child.layers) != 3 or len(child.hidden_sizes) < 2:
-        return False
-    if old_hidden_sizes is None or len(old_hidden_sizes) < 2:
-        return False
+def maybe_apply_freeze_policy(child, parent) -> bool:
+    if hasattr(child, "apply_freeze_policy"):
+        try:
+            return bool(child.apply_freeze_policy(parent=parent))
+        except TypeError:
+            return bool(child.apply_freeze_policy(parent))
+    return False
 
-    old_h1, old_h2 = int(old_hidden_sizes[0]), int(old_hidden_sizes[1])
-    new_h1, new_h2 = int(child.hidden_sizes[0]), int(child.hidden_sizes[1])
 
-    # layer0: input -> h1   W: [h1, in]
-    l0 = child.layers[0]
-    m_w0 = torch.zeros_like(l0.weight)
-    m_b0 = torch.zeros_like(l0.bias)
-    if new_h1 > old_h1:
-        m_w0[old_h1:new_h1, :] = 1.0
-        m_b0[old_h1:new_h1] = 1.0
-    l0.weight.register_hook(lambda g, m=m_w0: g * m.to(g.device))
-    l0.bias.register_hook(lambda g, m=m_b0: g * m.to(g.device))
+def compute_actions_complexity(task_net, actions) -> float:
+    if hasattr(task_net, "actions_complexity"):
+        return float(task_net.actions_complexity(actions))
+    return float(sum(actions))
 
-    # layer1: h1 -> h2   W: [h2, h1]
-    l1 = child.layers[1]
-    m_w1 = torch.zeros_like(l1.weight)
-    m_b1 = torch.zeros_like(l1.bias)
-    if new_h2 > old_h2:
-        m_w1[old_h2:new_h2, :] = 1.0
-        m_b1[old_h2:new_h2] = 1.0
-    if new_h1 > old_h1:
-        m_w1[:, old_h1:new_h1] = 1.0
-    l1.weight.register_hook(lambda g, m=m_w1: g * m.to(g.device))
-    l1.bias.register_hook(lambda g, m=m_b1: g * m.to(g.device))
 
-    # layer2: h2 -> classes  W: [C, h2]
-    l2 = child.layers[2]
-    m_w2 = torch.zeros_like(l2.weight)
-    m_b2 = torch.zeros_like(l2.bias)
-    if new_h2 > old_h2:
-        m_w2[:, old_h2:new_h2] = 1.0
-    m_b2[:] = 0.0
-    l2.weight.register_hook(lambda g, m=m_w2: g * m.to(g.device))
-    l2.bias.register_hook(lambda g, m=m_b2: g * m.to(g.device))
+# -----------------------
+# Plotting helpers
+# -----------------------
+def _savefig(fig, path: Path):
+    ensure_dir(path.parent)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
 
-    return True
+
+def plot_first_task_curve(first_task_curve_online: list[float], out_path: Path):
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    xs = list(range(len(first_task_curve_online)))
+    ax.plot(xs, first_task_curve_online, marker="o")
+    ax.set_xlabel("Task index t (after finishing task t)")
+    ax.set_ylabel("Test accuracy on task 0")
+    ax.set_title("First-task accuracy vs time")
+    ax.set_ylim(0.0, 1.0)
+    _savefig(fig, out_path)
+
+
+def plot_avg_accuracy_curve(avg_acc_curve: list[float], out_path: Path):
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    xs = list(range(len(avg_acc_curve)))
+    ax.plot(xs, avg_acc_curve, marker="o")
+    ax.set_xlabel("Task index t (after finishing task t)")
+    ax.set_ylabel("Average test accuracy (tasks 0..t)")
+    ax.set_title("Average accuracy vs time")
+    ax.set_ylim(0.0, 1.0)
+    _savefig(fig, out_path)
+
+
+def plot_acc_heatmap(acc_matrix: list[list[float | None]], out_path: Path):
+    import numpy as np
+
+    T = len(acc_matrix)
+    A = np.full((T, T), np.nan, dtype=float)
+    for t in range(T):
+        for j in range(T):
+            v = acc_matrix[t][j]
+            if v is not None:
+                A[t, j] = float(v)
+
+    fig = plt.figure(figsize=(7, 6))
+    ax = fig.add_subplot(111)
+    im = ax.imshow(A, aspect="auto", vmin=0.0, vmax=1.0)
+    ax.set_xlabel("Test task j")
+    ax.set_ylabel("After training task t")
+    ax.set_title("Accuracy matrix A[t,j]")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    _savefig(fig, out_path)
+
+
+def plot_forgetting_bar(acc_matrix: list[list[float | None]], out_path: Path):
+    T = len(acc_matrix)
+    if T == 0:
+        return
+    last = acc_matrix[-1]
+
+    forgetting = []
+    for j in range(T):
+        vals = [acc_matrix[t][j] for t in range(j, T) if acc_matrix[t][j] is not None]
+        if not vals or last[j] is None:
+            forgetting.append(0.0)
+        else:
+            forgetting.append(float(max(vals) - float(last[j])))
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.bar(list(range(T)), forgetting)
+    ax.set_xlabel("Task j")
+    ax.set_ylabel("Forgetting F_j")
+    ax.set_title("Forgetting per task")
+    ax.set_ylim(0.0, max(0.05, max(forgetting) * 1.1))
+    _savefig(fig, out_path)
+
+
+def plot_acc_vs_complexity(train_stats: list[dict], out_path: Path):
+    xs = []
+    ys = []
+    labels = []
+    for s in train_stats:
+        t = s.get("task")
+        cx = s.get("best_complexity", None)
+        acc = s.get("best_val_acc", s.get("val_acc", None))
+        if cx is None or acc is None:
+            continue
+        xs.append(float(cx))
+        ys.append(float(acc))
+        labels.append(int(t))
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.scatter(xs, ys)
+    for x, y, t in zip(xs, ys, labels):
+        ax.annotate(str(t), (x, y))
+    ax.set_xlabel("Complexity (proxy)")
+    ax.set_ylabel("Validation accuracy")
+    ax.set_title("Accuracy vs complexity (task labels)")
+    ax.set_ylim(0.0, 1.0)
+    _savefig(fig, out_path)
+
+
+def make_all_plots(
+    out_dir: Path,
+    first_task_curve_online: list[float],
+    avg_acc_curve: list[float],
+    acc_matrix: list[list[float | None]],
+    train_stats: list[dict],
+):
+    plots_dir = ensure_dir(out_dir / "plots")
+    plot_first_task_curve(first_task_curve_online, plots_dir / "first_task_acc.png")
+    plot_avg_accuracy_curve(avg_acc_curve, plots_dir / "avg_acc.png")
+    plot_acc_heatmap(acc_matrix, plots_dir / "acc_matrix_heatmap.png")
+    plot_forgetting_bar(acc_matrix, plots_dir / "forgetting_bar.png")
+    plot_acc_vs_complexity(train_stats, plots_dir / "acc_vs_complexity.png")
 
 
 # -----------------------
@@ -258,7 +333,7 @@ def print_summary_table(train_stats: list[dict]):
             return f"{x:>{w}.4f}"
         return f"{str(x):>{w}}"
 
-    header = f"{'task':>4} | {'val':>8} | {'test':>8} | {'best_r':>8} | {'cx':>5} | {'note':>10}"
+    header = f"{'task':>4} | {'val':>8} | {'test':>8} | {'best_r':>8} | {'cx':>8} | {'note':>10}"
     print("\n" + header)
     print("-" * len(header))
     for s in train_stats:
@@ -268,12 +343,12 @@ def print_summary_table(train_stats: list[dict]):
         best_r = s.get("best_reward")
         cx = s.get("best_complexity")
         note = s.get("note", "")
-        print(f"{t:>4} | {_fmt(val)} | {_fmt(test)} | {_fmt(best_r)} | {_fmt(cx, w=5)} | {note:>10}")
+        print(f"{t:>4} | {_fmt(val)} | {_fmt(test)} | {_fmt(best_r)} | {_fmt(cx)} | {note:>10}")
     print("", flush=True)
 
 
 # -----------------------
-# Main training (RCL)
+# Main
 # -----------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -298,38 +373,45 @@ def main():
     controller_target = controller_cfg.pop("_target_")
     ControllerCls = import_from_target(controller_target)
 
-    action_spec = task_net.action_spec()
+    spec = task_net.action_spec()
     if "action_spec" not in controller_cfg:
-        controller_cfg["action_spec"] = action_spec
-
+        controller_cfg["action_spec"] = spec
     controller = ControllerCls(**controller_cfg).to(device)
+
     value_net = instantiate(cfg["value_net"]).to(device)
 
     validate_action_spec(task_net, controller, cfg)
 
-    train_stats = []
-    first_task_curve_online = []
-    task0_eval_data = None  # cache test-set task 0
+    train_stats: list[dict] = []
+    first_task_curve_online: list[float] = []
+    avg_acc_curve: list[float] = []
+    acc_matrix: list[list[float | None]] = []
+    task0_eval_data = None
+
+    trial_log_path = out_dir / "trial_log.jsonl"
 
     num_tasks = int(cfg["dataset"]["num_tasks"])
     batch_size = int(cfg["training"]["batch_size"])
     epochs_task = int(cfg["training"]["epochs_task"])
     lr_task = float(cfg["training"]["lr_task"])
     grad_clip = cfg["training"].get("grad_clip", None)
-
     trials = int(cfg["training"]["controller_trials"])
     alpha = float(cfg["rcl"]["reward_alpha"])
-
     print_every = int(cfg.get("logging", {}).get("print_every_trials", 25))
     print_first = int(cfg.get("logging", {}).get("print_first_trials", 3))
+
+    # -----------------------
+    # MICRO-OTTIMIZZAZIONE: cache loaders per tutti i task (una sola volta)
+    # -----------------------
+    tasks_data_cache = [dataset_obj.get_task(j, batch_size=batch_size) for j in range(num_tasks)]
 
     for t in range(num_tasks):
         print("\n" + "=" * 80, flush=True)
         print(f"[task {t}] start", flush=True)
-        task_data = dataset_obj.get_task(t, batch_size=batch_size)
 
+        task_data = tasks_data_cache[t]
         if task0_eval_data is None:
-            task0_eval_data = dataset_obj.get_task(0, batch_size=batch_size)
+            task0_eval_data = tasks_data_cache[0]
 
         if t == 0:
             print(f"[task {t}] base train: epochs={epochs_task} lr={lr_task}", flush=True)
@@ -346,11 +428,8 @@ def main():
             test_acc = eval_accuracy(task_net, task_data["test"], device)
             print(f"[task {t}] base done: val={val_acc:.4f} test={test_acc:.4f}", flush=True)
 
-            train_stats.append(
-                {"task": t, "val_acc": float(val_acc), "test_acc": float(test_acc), "note": "base_train"}
-            )
+            train_stats.append({"task": t, "val_acc": float(val_acc), "test_acc": float(test_acc), "note": "base_train"})
 
-            # timestamp per task-aware inference
             if hasattr(task_net, "register_task_slice"):
                 task_net.register_task_slice()
 
@@ -363,6 +442,7 @@ def main():
             best_actions = None
             best_val_acc = None
             best_test_acc = None
+            best_complexity = None
 
             print(f"[task {t}] controller search: trials={trials} alpha={alpha}", flush=True)
             t0 = time.time()
@@ -370,10 +450,8 @@ def main():
             for k in range(1, trials + 1):
                 actions, logp_sum = controller.sample(device=device)
 
-                old_hidden = getattr(task_net, "hidden_sizes", None)
                 child = task_net.expanded_copy(actions).to(device)
-
-                masked = register_freeze_masks_expandable_mlp(child, old_hidden)
+                masked = maybe_apply_freeze_policy(child=child, parent=task_net)
 
                 train_supervised(
                     model=child,
@@ -386,7 +464,8 @@ def main():
                 )
 
                 val_acc = eval_accuracy(child, task_data["val"], device)
-                complexity = int(sum(actions))
+
+                complexity = compute_actions_complexity(task_net, actions)
                 reward = float(val_acc) - alpha * float(complexity)
 
                 v = value_net_scalar(value_net, device=device, t=t, num_tasks=num_tasks)
@@ -407,6 +486,22 @@ def main():
                     torch.nn.utils.clip_grad_norm_(value_net.parameters(), float(grad_clip))
                 opt_v.step()
 
+                append_jsonl(
+                    {
+                        "task": int(t),
+                        "trial": int(k),
+                        "reward": float(reward),
+                        "val_acc": float(val_acc),
+                        "complexity": float(complexity),
+                        "actions": list(map(int, actions)),
+                        "masked": int(masked),
+                        "loss_c": float(loss_c.item()),
+                        "loss_v": float(loss_v.item()),
+                        "alpha": float(alpha),
+                    },
+                    trial_log_path,
+                )
+
                 improved = False
                 if reward > best_reward:
                     test_acc = eval_accuracy(child, task_data["test"], device)
@@ -414,6 +509,7 @@ def main():
                     best_actions = list(actions)
                     best_val_acc = float(val_acc)
                     best_test_acc = float(test_acc)
+                    best_complexity = float(complexity)
                     best_model_state = {kk: vv.detach().cpu() for kk, vv in child.state_dict().items()}
                     improved = True
 
@@ -422,23 +518,21 @@ def main():
                     tag = "BEST" if improved else "info"
                     print(
                         f"[task {t}] trial {k:04d}/{trials} ({tag}) "
-                        f"reward={reward:.4f} val={val_acc:.4f} cx={complexity} "
+                        f"reward={reward:.4f} val={val_acc:.4f} cx={complexity:.2f} "
                         f"masked={int(masked)} "
                         f"loss_c={float(loss_c.item()):.4f} loss_v={float(loss_v.item()):.4f} "
                         f"best_reward={best_reward:.4f} elapsed={elapsed:.1f}s",
                         flush=True,
                     )
                     if improved:
-                        print(f"[task {t}]   best_actions={best_actions}", flush=True)
+                        print(f"[task {t}] best_actions={best_actions}", flush=True)
 
             if best_actions is None or best_model_state is None:
                 raise RuntimeError(f"[task {t}] No best model selected; check controller.sample().")
 
-            # Promote best child: ricrea architettura espansa + carica pesi
             task_net = task_net.expanded_copy(best_actions).to(device)
             task_net.load_state_dict(best_model_state)
 
-            # timestamp per task-aware inference
             if hasattr(task_net, "register_task_slice"):
                 task_net.register_task_slice()
 
@@ -449,21 +543,35 @@ def main():
                     "best_actions": best_actions,
                     "best_val_acc": float(best_val_acc),
                     "best_test_acc": float(best_test_acc),
-                    "best_complexity": int(sum(best_actions)),
+                    "best_complexity": float(best_complexity),
                 }
             )
 
             print(
                 f"[task {t}] done: best_reward={best_reward:.4f} "
                 f"best_val={best_val_acc:.4f} best_test={best_test_acc:.4f} "
-                f"best_cx={int(sum(best_actions))}",
+                f"best_cx={float(best_complexity):.2f}",
                 flush=True,
             )
 
-        # --- Online lightweight metric: A[t][0] ---
+        # -----------------------
+        # Evaluate CL metrics after each task t
+        # -----------------------
         acc0 = float(eval_accuracy(task_net, task0_eval_data["test"], device, task_id=0))
         first_task_curve_online.append(acc0)
         print(f"[task {t}] online first-task acc={acc0:.4f}", flush=True)
+
+        row: list[float | None] = [None] * num_tasks
+        test_accs_seen = []
+        for j in range(t + 1):
+            aj = float(eval_accuracy(task_net, tasks_data_cache[j]["test"], device, task_id=j))
+            row[j] = aj
+            test_accs_seen.append(aj)
+        acc_matrix.append(row)
+
+        avg_acc = float(sum(test_accs_seen) / max(1, len(test_accs_seen)))
+        avg_acc_curve.append(avg_acc)
+        print(f"[task {t}] avg test acc (0..t)={avg_acc:.4f}", flush=True)
 
         save_ckpt(
             ckpt_dir / f"task_{t:03d}.pt",
@@ -473,18 +581,26 @@ def main():
                 "controller_state": controller.state_dict(),
                 "value_net_state": value_net.state_dict(),
                 "cfg": cfg,
-                "task_net_hidden_sizes": getattr(task_net, "hidden_sizes", None),
                 "task_net_task_slices": getattr(task_net, "task_slices", None),
             },
         )
 
         save_json(
-            {"train_stats": train_stats, "first_task_curve_online": first_task_curve_online},
+            {
+                "train_stats": train_stats,
+                "first_task_curve_online": first_task_curve_online,
+                "avg_acc_curve": avg_acc_curve,
+            },
             out_dir / "train_stats.json",
         )
-        print(f"[task {t}] saved checkpoint + train_stats.json", flush=True)
+        save_json({"acc_matrix": acc_matrix}, out_dir / "acc_matrix.json")
 
-    print_summary_table(train_stats)
+        make_all_plots(out_dir, first_task_curve_online, avg_acc_curve, acc_matrix, train_stats)
+
+        print(f"[task {t}] saved checkpoint + logs + plots", flush=True)
+        print_summary_table(train_stats)
+
+    make_all_plots(out_dir, first_task_curve_online, avg_acc_curve, acc_matrix, train_stats)
     print("Done. Results saved to:", out_dir, flush=True)
 
 

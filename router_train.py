@@ -5,7 +5,7 @@ import importlib
 import json
 import re
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Dict, Any, Optional
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +14,9 @@ import yaml
 from router.router_model import RouterActorCritic
 
 
+# -----------------------
+# YAML instantiate helpers
+# -----------------------
 def import_from_target(target: str):
     mod_name, cls_name = target.split(":")
     mod = importlib.import_module(mod_name)
@@ -26,6 +29,9 @@ def instantiate(cfg_block: dict):
     return cls(**cfg_block)
 
 
+# -----------------------
+# Utils
+# -----------------------
 def get_device(name: str) -> torch.device:
     if name == "cuda" and torch.cuda.is_available():
         return torch.device("cuda")
@@ -59,23 +65,32 @@ def find_last_ckpt(ckpt_dir: Path) -> Path:
     return cands[-1]
 
 
+def torch_load_safe(path: Path, device: torch.device):
+    """
+    Compatibile con PyTorch recenti che introducono weights_only e warning.
+    Se weights_only non è supportato, fa fallback.
+    Vedi doc torch.load. 
+    """
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+# -----------------------
+# Tasknet load (modulare)
+# -----------------------
 def load_tasknet_last(cfg: dict, device: torch.device, ckpt_dir: Path):
     ckpt_path = find_last_ckpt(ckpt_dir)
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch_load_safe(ckpt_path, device=device)
 
-    task_cfg = dict(cfg["task_net"])
-    TaskCls = import_from_target(task_cfg.pop("_target_"))
+    # Costruisci la tasknet dal YAML (qualunque classe sia)
+    tasknet = instantiate(cfg["task_net"]).to(device)
 
-    hidden_sizes = ckpt.get("task_net_hidden_sizes", task_cfg["hidden_sizes"])
-    tasknet = TaskCls(
-        input_dim=task_cfg["input_dim"],
-        hidden_sizes=hidden_sizes,
-        num_classes=task_cfg["num_classes"],
-        action_spec=task_cfg["action_spec"],
-    ).to(device)
-
+    # Carica pesi
     tasknet.load_state_dict(ckpt["task_net_state"])
 
+    # Carica task_slices (serve per task-aware inference)
     task_slices = ckpt.get("task_net_task_slices", None)
     if task_slices is None:
         raise KeyError("Checkpoint non contiene task_net_task_slices (serve per task-aware inference).")
@@ -84,6 +99,9 @@ def load_tasknet_last(cfg: dict, device: torch.device, ckpt_dir: Path):
     return tasknet, ckpt_path
 
 
+# -----------------------
+# Forward helper: task-aware per batch mista
+# -----------------------
 def grouped_tasknet_forward(tasknet, x: torch.Tensor, task_ids: torch.Tensor) -> torch.Tensor:
     B = x.size(0)
     out = torch.empty((B, tasknet.num_classes), device=x.device, dtype=torch.float32)
@@ -91,11 +109,6 @@ def grouped_tasknet_forward(tasknet, x: torch.Tensor, task_ids: torch.Tensor) ->
         idx = (task_ids == t).nonzero(as_tuple=True)[0]
         out[idx] = tasknet(x[idx], task_id=int(t))
     return out
-
-
-def slice_cost(task_slices: List[Tuple[int, int]], t: torch.Tensor) -> torch.Tensor:
-    h = torch.tensor([a + b for (a, b) in task_slices], dtype=torch.float32, device=t.device)
-    return h[t]
 
 
 def iterate_task_batches(tasks_data: List[dict], split: str):
@@ -134,6 +147,23 @@ def eval_end_to_end(router, tasknet, tasks_data, device: torch.device, split: st
     }
 
 
+def get_task_costs(tasknet, device: torch.device) -> Optional[torch.Tensor]:
+    """
+    Modularità:
+    - Se la tasknet implementa task_costs(), usiamo quella.
+    - Altrimenti: niente penalità (None).
+    """
+    if hasattr(tasknet, "task_costs"):
+        costs = tasknet.task_costs(device=device)
+        if not torch.is_tensor(costs):
+            costs = torch.tensor(costs, dtype=torch.float32, device=device)
+        return costs.to(device)
+    return None
+
+
+# -----------------------
+# Main
+# -----------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, required=True)
@@ -172,9 +202,13 @@ def main():
     tasknet, used_ckpt = load_tasknet_last(cfg, device=device, ckpt_dir=ckpt_dir)
     freeze_module(tasknet)
 
+    # Qui NON leggiamo più cfg["task_net"]["input_dim"] (MLP-only).
+    # Usiamo una sezione router nel YAML.
+    router_input_dim = int(cfg.get("router", {}).get("input_dim", 784))
+
     router = RouterActorCritic(
         num_tasks=num_tasks,
-        input_dim=int(cfg["task_net"]["input_dim"]),
+        input_dim=router_input_dim,
         hidden=int(args.router_hidden),
         emb=int(args.router_emb),
     ).to(device)
@@ -185,6 +219,9 @@ def main():
         router.train()
         total_loss = 0.0
         total = 0
+
+        # precompute costs una volta per epoca
+        costs = get_task_costs(tasknet, device=device)
 
         for x, y, _t_true in iterate_task_batches(tasks_data, split="train"):
             x = x.to(device)
@@ -203,13 +240,13 @@ def main():
             else:
                 r = -F.cross_entropy(logits, y, reduction="none")
 
-            if args.beta_cost > 0.0:
-                r = r - args.beta_cost * slice_cost(tasknet.task_slices, a)
+            if args.beta_cost > 0.0 and costs is not None:
+                r = r - float(args.beta_cost) * costs[a]
 
             adv = r - v
             loss_actor = -(logp * adv.detach()).mean()
             loss_critic = 0.5 * (adv ** 2).mean()
-            loss = loss_actor + loss_critic - args.entropy_coef * ent
+            loss = loss_actor + loss_critic - float(args.entropy_coef) * ent
 
             opt.zero_grad()
             loss.backward()
@@ -232,7 +269,7 @@ def main():
     torch.save(
         {
             "router_state": router.state_dict(),
-            "router_cfg": {"hidden": args.router_hidden, "emb": args.router_emb},
+            "router_cfg": {"hidden": args.router_hidden, "emb": args.router_emb, "input_dim": router_input_dim},
             "tasknet_ckpt": str(used_ckpt),
             "yaml_cfg": cfg,
         },

@@ -1,7 +1,7 @@
 seed: 71
 experiment:
-  name: "rcl_permuted_mnist"
-  out_dir: "./runs/rcl_permuted_mnist"
+  name: "rcl_VGG_permuted_mnist"
+  out_dir: "./runs/rcl_VGG_permuted_mnist"
 
 training:
   device: "cuda"              # "cpu" o "cuda"
@@ -24,22 +24,76 @@ dataset:
   train_val_split: 0.9
   num_workers: 0 #1
 
-task_net:
-  _target_: task_nets.expandable_mlp:ExpandableMLP
-  input_dim: 784
-  hidden_sizes: [312, 128]
-  num_classes: 10
-  action_spec: [30, 30, 30]   # 3 decisioni: L1, L2, L3 (range 0..29) [file:2]
+# task_net:
+#   _target_: task_nets.expandable_mlp:ExpandableMLP
+#   input_dim: 784
+#   hidden_sizes: [312, 128]
+#   num_classes: 10
+#   action_spec: [30, 30, 30]   # 3 decisioni: L1, L2, L3 (range 0..29) [file:2]
 
+
+task_net:
+  _target_: task_nets.expandable_vgg:ExpandableVGG
+  in_channels: 1
+  block_specs: [[1, 32], [1, 64], [2, 128], [2, 256]]    #[128, 240, 296, 408]
+  num_classes: 10
+  action_spec: [11, 11, 11, 11]
+  delta_step: 8
+  use_gap: true
+  dropout: 0.1
+
+# controller:
+#   _target_: controllers.lstm_controller:LSTMController
+#   hidden_size: 100
+#   num_layers: 2
+  
 controller:
-  _target_: controllers.lstm_controller:LSTMController
-  hidden_size: 100
-  num_layers: 2
+  target: ppo_lstm_controller.PPOLSTMController
+  hiddensize: 100
+  numlayers: 2
+
+ppo:
+  clip_eps: 0.2
+  epochs: 4
+  entropycoef: 0.01
+  max_grad_norm: 1.0
 
 value_net:
   _target_: value_nets.mlp_value:MLPValueNet
   hiddensize: 100
 
+router:
+  input_dim: 784
+  
 evaluation:
   batch_size: 256
   device: "cuda"
+
+
+
+
+
+
+
+
+
+
+# task_net:
+#   _target_: task_nets.expandable_vgg:ExpandableVGG
+#   in_channels: 1
+#   block_specs: [[1, 32], [1, 64], [2, 128], [2, 256], [2, 256]]
+#   num_classes: 10
+#   action_spec: [6, 6, 6, 6, 6]   # 0..5
+#   delta_step: 8                  # delta = 0,16,32,48,64,80 canali per blocco
+#   use_gap: true
+#   dropout: 0.1
+
+# task_net:
+#   _target_: task_nets.expandable_vgg:ExpandableVGG
+#   in_channels: 1
+#   block_specs: [[1,32],[2,64],[2,128],[2,128]]
+#   num_classes: 10
+#   action_spec: [5,5,5,5,5]
+#   delta_step: 8
+#   use_gap: true
+#   dropout: 0.0
